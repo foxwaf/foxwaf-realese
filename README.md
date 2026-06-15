@@ -461,6 +461,17 @@ password_salt: ""
 
 ---
 
+## 🧩 开源组件
+
+WAF 核心中通用、可复用的基础设施已抽离为独立组件，置于 [`waf-engine/`](waf-engine/) 目录，各自独立 Go module、可单独引用：
+
+| 组件 | 说明 | License |
+|:---|:---|:---|
+| [`foxhttp`](waf-engine/foxhttp/) | 高性能原生 HTTP 入口框架，统一支撑 HTTP/1.1·2·3 与国密 TLCP | Apache-2.0 |
+| [`acmatch`](waf-engine/acmatch/) | 多模式匹配引擎：Aho-Corasick 自动机 + 正则字面量预筛，benign 流量走 no-match 快路径、零漏检 | AGPL-3.0 |
+
+---
+
 ## 📄 许可证
 
 本项目基于 [Apache License 2.0](LICENSE) 开源。
