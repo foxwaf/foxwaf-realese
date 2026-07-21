@@ -276,17 +276,34 @@ _preserve_runtime_conf() {
     fi
     if [[ -f "${INSTALL_DIR}/conf.yaml" && -s "${INSTALL_DIR}/conf.yaml" ]]; then
         log_dim "保留配置: ${INSTALL_DIR}/conf.yaml"
-        return 0
+    elif docker inspect "$CONTAINER" &>/dev/null \
+        && docker cp "${CONTAINER}:/app/conf.yaml" "${INSTALL_DIR}/conf.yaml" 2>/dev/null \
+        && [[ -f "${INSTALL_DIR}/conf.yaml" && -s "${INSTALL_DIR}/conf.yaml" ]]; then
+        log_ok "已保存当前配置 conf.yaml"
+    else
+        log_err "未找到可持久化的 conf.yaml，已中止，避免账号/入口/端口回默认"
+        log_dim "请先执行 foxwaf start 后重试，或手动放置 ${INSTALL_DIR}/conf.yaml"
+        return 1
     fi
-    if docker inspect "$CONTAINER" &>/dev/null; then
-        if docker cp "${CONTAINER}:/app/conf.yaml" "${INSTALL_DIR}/conf.yaml" 2>/dev/null && [[ -f "${INSTALL_DIR}/conf.yaml" && -s "${INSTALL_DIR}/conf.yaml" ]]; then
-            log_ok "已保存当前配置 conf.yaml"
-            return 0
+
+    # v1.7.7 及以前的插件配置位于容器可写层。首次完整镜像更新前
+    # 把它迁移到 data/ 持久化卷，新版 WAF 也默认从该路径读写。
+    mkdir -p "${INSTALL_DIR}/data"
+    local plugin_conf="${INSTALL_DIR}/data/plugin.yaml"
+    if [[ -f "$plugin_conf" && -s "$plugin_conf" ]]; then
+        log_dim "保留插件配置: ${plugin_conf}"
+    elif docker inspect "$CONTAINER" &>/dev/null; then
+        docker cp "${CONTAINER}:/app/data/plugin.yaml" "$plugin_conf" 2>/dev/null \
+            || docker cp "${CONTAINER}:/app/plugins/plugin.yaml" "$plugin_conf" 2>/dev/null \
+            || true
+        if [[ -f "$plugin_conf" && -s "$plugin_conf" ]]; then
+            log_ok "已保存当前插件配置 plugin.yaml"
+        else
+            rm -f "$plugin_conf"
+            log_warn "未找到旧插件配置，新镜像将使用内置默认配置"
         fi
     fi
-    log_err "未找到可持久化的 conf.yaml，已中止，避免账号/入口/端口回默认"
-    log_dim "请先执行 foxwaf start 后重试，或手动放置 ${INSTALL_DIR}/conf.yaml"
-    return 1
+    return 0
 }
 
 _install_cli_update() {
@@ -1225,7 +1242,7 @@ do_update() {
             compose_f=$(_compose_file)
             [[ -z "$compose_f" ]] && compose_f="${INSTALL_DIR}/docker-compose.yml"
             _write_docker_compose "$compose_f" "foxwaf:${nv}"
-            log_dim "配置已持久化: conf.yaml / data"
+            log_dim "配置已持久化: conf.yaml / data / data/plugin.yaml"
             cd "$INSTALL_DIR" && docker compose down &>/dev/null || docker stop "$CONTAINER" &>/dev/null || true
             docker rm "$CONTAINER" &>/dev/null || true
             echo "$nv" > "${INSTALL_DIR}/.version"

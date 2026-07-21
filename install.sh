@@ -493,6 +493,18 @@ install_docker() {
 
     log_step "配置"
     mkdir -p "$INSTALL_DIR/data"
+    # 旧版把 plugin.yaml 放在容器可写层；重建前迁移到 data/ 持久化卷。
+    local plugin_conf="$INSTALL_DIR/data/plugin.yaml"
+    if [[ ! -f "$plugin_conf" || ! -s "$plugin_conf" ]] && docker inspect foxwaf &>/dev/null; then
+        docker cp foxwaf:/app/data/plugin.yaml "$plugin_conf" 2>/dev/null \
+            || docker cp foxwaf:/app/plugins/plugin.yaml "$plugin_conf" 2>/dev/null \
+            || true
+        if [[ -f "$plugin_conf" && -s "$plugin_conf" ]]; then
+            log_ok "已保存现有插件配置 plugin.yaml"
+        else
+            rm -f "$plugin_conf"
+        fi
+    fi
     if [[ -d "$INSTALL_DIR/conf.yaml" ]]; then
         local bad_conf
         bad_conf="$INSTALL_DIR/conf.yaml.bad.$(date +%Y%m%d%H%M%S)"
@@ -528,7 +540,7 @@ services:
       - ./conf.yaml:/app/conf.yaml
       - ./data:/app/data
 DEOF
-    log_ok "Compose 配置已生成（conf.yaml 与 data/ 已持久化）"
+    log_ok "Compose 配置已生成（conf.yaml、data/ 与插件配置已持久化）"
     echo "$VERSION" > "$INSTALL_DIR/.version"
     install_foxwaf_bin
 
