@@ -160,10 +160,8 @@ is_docker() { [[ -f "${INSTALL_DIR}/docker-compose.yml" || -f "${INSTALL_DIR}/do
 # 但容器内 binary 经 in-process 更新后真实版本会与该文件错位（最严重时差 5 个 beta），
 # 导致 update 把容器降级到更老版本。
 #
-# 现在所有"当前版本"取值都走 _live_version()，优先级：
-#   1. /app/history/current（容器内）或 ${INSTALL_DIR}/history/current（裸机）
-#   2. 通过 docker exec 读容器内 .version（兜底）
-#   3. ${INSTALL_DIR}/.version（最后兜底，可能漂移）
+# 现在所有"当前版本"取值都走 _live_version()。完整更新以正在运行的镜像 tag 为准；
+# source.enc 热更新不会改变镜像版本，因此不再读取容器可写层里的 history/current。
 # ════════════════════════════════════════════════════════════════════════════
 
 # _live_version 返回 binary 真实运行版本。容器未运行时回退到本地文件并附标记。
@@ -171,17 +169,15 @@ is_docker() { [[ -f "${INSTALL_DIR}/docker-compose.yml" || -f "${INSTALL_DIR}/do
 _live_version() {
     local v=""
     if is_docker; then
+        v=$(_image_version)
+        [[ -n "$v" ]] && { echo "$v"; return 0; }
         if docker inspect "$CONTAINER" &>/dev/null && \
            [[ "$(docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]]; then
-            v=$(docker exec "$CONTAINER" cat /app/history/current 2>/dev/null | tr -d '[:space:]')
-            if [[ -z "$v" ]]; then
-                # 容器在跑但 history/current 缺失：尝试 .version
-                v=$(docker exec "$CONTAINER" cat /app/.version 2>/dev/null | tr -d '[:space:]')
-            fi
+            v=$(docker exec "$CONTAINER" cat /app/.version 2>/dev/null | tr -d '[:space:]')
             [[ -n "$v" ]] && { echo "$v"; return 0; }
         fi
-    elif [[ -f "${INSTALL_DIR}/history/current" ]]; then
-        v=$(cat "${INSTALL_DIR}/history/current" 2>/dev/null | tr -d '[:space:]')
+    elif [[ -f "${INSTALL_DIR}/data/update-history/current" ]]; then
+        v=$(cat "${INSTALL_DIR}/data/update-history/current" 2>/dev/null | tr -d '[:space:]')
         [[ -n "$v" ]] && { echo "$v"; return 0; }
     fi
     # 兜底：本地 .version 文件，但加 @stale 标记便于上层警告
@@ -263,8 +259,68 @@ services:
     network_mode: host
     volumes:
       - ./conf.yaml:/app/conf.yaml
+      - ./source.enc:/app/source.enc
       - ./data:/app/data
 DEOF
+}
+
+_extract_source_from_image() {
+    local image="$1" dest="$2" cid tmp
+    tmp="${dest}.new"
+    rm -f "$tmp"
+    cid=$(docker create "$image" 2>/dev/null) || return 1
+    if ! docker cp "${cid}:/app/source.enc" "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+        docker rm "$cid" &>/dev/null || true
+        rm -f "$tmp"
+        return 1
+    fi
+    docker rm "$cid" &>/dev/null || true
+    chmod 0644 "$tmp"
+    mv "$tmp" "$dest"
+}
+
+_save_update_rollback() {
+    local current_version="$1" ts dir image_id tag cli
+    ts=$(date +%Y%m%d%H%M%S)
+    dir="${INSTALL_DIR}/rollback/${ts}-${current_version//[^a-zA-Z0-9._-]/_}"
+    mkdir -p "$dir"
+    image_id=$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null) || return 1
+    [[ -n "$image_id" ]] || return 1
+    tag="foxwaf:rollback-${current_version//[^a-zA-Z0-9._-]/_}-${ts}"
+    docker tag "$image_id" "$tag" || return 1
+    printf '%s\n' "$tag" > "${dir}/image-tag"
+    printf '%s\n' "$current_version" > "${dir}/version"
+    [[ -f "${INSTALL_DIR}/source.enc" ]] \
+        && cp -p "${INSTALL_DIR}/source.enc" "${dir}/source.enc" \
+        || docker cp "${CONTAINER}:/app/source.enc" "${dir}/source.enc" 2>/dev/null \
+        || return 1
+    [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] && cp -p "${INSTALL_DIR}/docker-compose.yml" "${dir}/docker-compose.yml"
+    [[ -f "${INSTALL_DIR}/docker-compose.yaml" ]] && cp -p "${INSTALL_DIR}/docker-compose.yaml" "${dir}/docker-compose.yaml"
+    [[ -f "${INSTALL_DIR}/.version" ]] && cp -p "${INSTALL_DIR}/.version" "${dir}/.version"
+    cli=$(command -v foxwaf 2>/dev/null || true)
+    [[ -n "$cli" && -f "$cli" ]] && cp -p "$cli" "${dir}/foxwaf"
+    find "${INSTALL_DIR}/rollback" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr | tail -n +6 | cut -d' ' -f2- | while IFS= read -r old; do
+            [[ -n "$old" ]] && rm -rf "$old"
+        done
+    echo "$dir"
+}
+
+_restore_update_rollback() {
+    local dir="$1" image version compose_f
+    [[ -d "$dir" && -s "${dir}/image-tag" && -s "${dir}/source.enc" ]] || return 1
+    image=$(tr -d '\r\n' < "${dir}/image-tag")
+    version=$(tr -d '\r\n' < "${dir}/version")
+    docker image inspect "$image" &>/dev/null || return 1
+    cp -p "${dir}/source.enc" "${INSTALL_DIR}/source.enc" || return 1
+    compose_f=$(_compose_file)
+    [[ -z "$compose_f" ]] && compose_f="${INSTALL_DIR}/docker-compose.yml"
+    _write_docker_compose "$compose_f" "$image"
+    printf '%s\n' "$version" > "${INSTALL_DIR}/.version"
+    cd "$INSTALL_DIR" && docker compose up -d --force-recreate &>/dev/null || return 1
+    if [[ -s "${dir}/foxwaf" ]]; then
+        _install_cli_update "${dir}/foxwaf"
+    fi
 }
 
 _preserve_runtime_conf() {
@@ -307,14 +363,26 @@ _preserve_runtime_conf() {
 }
 
 _install_cli_update() {
-    local src="$1" dst
+    local src="$1" dst tmp_cli
     [[ -s "$src" ]] || return 0
     head -1 "$src" | grep -q '^#!/bin/bash' || return 0
     dst=$(command -v foxwaf 2>/dev/null || true)
     [[ -z "$dst" ]] && dst="/usr/local/bin/foxwaf"
-    cp -f "$src" "$dst" 2>/dev/null || return 0
-    chmod +x "$dst" 2>/dev/null || true
-    sed -i "s|^INSTALL_DIR=.*|INSTALL_DIR=\"${INSTALL_DIR}\"|" "$dst" 2>/dev/null || true
+
+    # 不能原地覆盖正在执行的脚本：新版更长时，当前 Bash 会从旧 EOF
+    # 继续读取新版尾部并把它当命令执行。先写同目录临时文件，再原子替换。
+    tmp_cli=$(mktemp "${dst}.tmp.XXXXXX" 2>/dev/null) || {
+        log_warn "管理工具同步失败: 无法创建临时文件"
+        return 0
+    }
+    if ! cp -f "$src" "$tmp_cli" 2>/dev/null \
+        || ! chmod 0755 "$tmp_cli" 2>/dev/null \
+        || ! sed -i "s|^INSTALL_DIR=.*|INSTALL_DIR=\"${INSTALL_DIR}\"|" "$tmp_cli" 2>/dev/null \
+        || ! mv -f "$tmp_cli" "$dst" 2>/dev/null; then
+        rm -f "$tmp_cli"
+        log_warn "管理工具同步失败: ${dst}"
+        return 0
+    fi
     log_dim "管理工具已同步: ${dst}"
 }
 
@@ -691,11 +759,8 @@ do_status() {
     local drift=0
     if [[ "$running" == "true" ]]; then
         local live_ver=""
-        if is_docker; then
-            live_ver=$(docker exec "$CONTAINER" cat /app/history/current 2>/dev/null | tr -d '[:space:]')
-        elif [[ -f "${INSTALL_DIR}/history/current" ]]; then
-            live_ver=$(cat "${INSTALL_DIR}/history/current" 2>/dev/null | tr -d '[:space:]')
-        fi
+        live_ver=$(_live_version)
+        live_ver=$(_live_version_clean "$live_ver")
         [[ -n "$live_ver" ]] && ver="$live_ver"
         # 漂移检测（F 项要求）：image tag 与 binary 真实版本对比
         if is_docker && [[ -n "$img_name" ]]; then
@@ -1223,18 +1288,35 @@ do_update() {
     confirm "立即更新？" || { log_dim "已取消"; return 0; }
 
     local tmp; tmp=$(mktemp -d)
+    local rollback_dir=""
 
     log_step "下载 Docker 镜像"
     if _dl "foxwaf-image.tar.gz" "${tmp}/img.tar.gz" "$nv" "Docker 镜像"; then
         _dl "foxwaf-image.tar.gz.md5" "${tmp}/img.md5" "$nv" "镜像校验" 2>/dev/null || true
         _dl "foxwaf" "${tmp}/foxwaf.new" "$nv" "管理工具" 2>/dev/null || true
         if _md5ok "${tmp}/img.tar.gz" "${tmp}/img.md5"; then
+            rollback_dir=$(_save_update_rollback "$cv")
+            if [[ -z "$rollback_dir" ]]; then
+                log_err "创建更新回滚点失败，已中止"
+                rm -rf "$tmp"
+                return 1
+            fi
+            log_dim "已创建回滚点: $(basename "$rollback_dir")"
             log_step "安装更新"
             docker load -i "${tmp}/img.tar.gz" &>/dev/null &
             if spinner $! "导入镜像"; then
                 printf "\r%60s\r" ""
+            else
+                log_err "导入镜像失败，原服务未变更"
+                rm -rf "$tmp"
+                return 1
             fi
             if ! _preserve_runtime_conf; then
+                rm -rf "$tmp"
+                return 1
+            fi
+            if ! _extract_source_from_image "foxwaf:${nv}" "${INSTALL_DIR}/source.enc"; then
+                log_err "从新镜像提取 source.enc 失败，已中止"
                 rm -rf "$tmp"
                 return 1
             fi
@@ -1247,7 +1329,29 @@ do_update() {
             docker rm "$CONTAINER" &>/dev/null || true
             echo "$nv" > "${INSTALL_DIR}/.version"
             cd "$INSTALL_DIR" && docker compose up -d &>/dev/null &
-            spinner $! "启动新版本" && printf "\r%60s\r" ""
+            if spinner $! "启动新版本"; then
+                printf "\r%60s\r" ""
+            else
+                log_err "新版本启动失败，正在自动回滚"
+                if _restore_update_rollback "$rollback_dir"; then
+                    log_ok "已自动恢复到 ${cv}"
+                else
+                    log_err "自动回滚失败，请执行: foxwaf rollback ${cv}"
+                fi
+                rm -rf "$tmp"
+                return 1
+            fi
+            sleep 1
+            if [[ "$(docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null)" != "true" ]]; then
+                log_err "新容器未正常运行，正在自动回滚"
+                if _restore_update_rollback "$rollback_dir"; then
+                    log_ok "已自动恢复到 ${cv}"
+                else
+                    log_err "自动回滚失败，请执行: foxwaf rollback ${cv}"
+                fi
+                rm -rf "$tmp"
+                return 1
+            fi
             _install_cli_update "${tmp}/foxwaf.new"
             _gap
             if [[ "$cmp" == "-1" ]]; then
@@ -1262,6 +1366,38 @@ do_update() {
         log_err "下载失败"
     fi
     rm -rf "$tmp"
+}
+
+do_rollback() {
+    local target="${1:-latest}" root="${INSTALL_DIR}/rollback" dir="" version
+    [[ -d "$root" ]] || { log_err "暂无可用回滚点"; return 1; }
+    if [[ "$target" == "--list" || "$target" == "list" ]]; then
+        log_step "可用回滚点"
+        while IFS= read -r dir; do
+            [[ -d "$dir" ]] || continue
+            version=$(tr -d '\r\n' < "${dir}/version" 2>/dev/null)
+            log_kv "$(basename "$dir")" "$version"
+        done < <(find "$root" -mindepth 1 -maxdepth 1 -type d | sort -r)
+        return 0
+    fi
+    while IFS= read -r candidate; do
+        [[ -d "$candidate" ]] || continue
+        version=$(tr -d '\r\n' < "${candidate}/version" 2>/dev/null)
+        if [[ "$target" == "latest" || "$target" == "$version" || "$target" == "$(basename "$candidate")" ]]; then
+            dir="$candidate"
+            break
+        fi
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d | sort -r)
+    [[ -n "$dir" ]] || { log_err "未找到回滚点: ${target}"; return 1; }
+    version=$(tr -d '\r\n' < "${dir}/version" 2>/dev/null)
+    log_warn "将恢复完整镜像、source.enc 与 foxwaf 脚本到 ${version}"
+    confirm "确认回滚？" || { log_dim "已取消"; return 0; }
+    if _restore_update_rollback "$dir"; then
+        log_ok "已回滚到 ${version}"
+    else
+        log_err "回滚失败，服务文件未能完整恢复"
+        return 1
+    fi
 }
 
 # ╔═══════════════════════════════════════════════════════════════╗
@@ -1317,6 +1453,7 @@ show_help() {
     printf "  ${C}${B}维护${N}\n"
     _gap
     printf "    ${W}update${N}      ${DM}检查并安装更新 ${DM}[--allow-downgrade]${N}\n"
+    printf "    ${W}rollback${N}    ${DM}回滚完整镜像、资源和管理脚本 ${DM}[版本|latest|--list]${N}\n"
     printf "    ${W}export${N}      ${DM}Docker：容器快照（docker commit+save）；裸机：目录文件${N}\n"
     printf "    ${W}import${N}      ${DM}恢复备份 ${DM}[foxwaf import <file>]${N}\n"
     printf "    ${W}reset-auth${N}  ${DM}重置用户名/密码，写入 SHA256+salt 并热加载（无需重启）${N}\n"
@@ -1328,31 +1465,21 @@ show_help() {
 # ── 入口 ─────────────────────────────────────────────────────────
 [[ ! -d "$INSTALL_DIR" ]] && { log_err "未找到安装目录: ${INSTALL_DIR}"; exit 1; }
 
-# ╔═══════════════════════════════════════════════════════════════╗
-# ║  实时状态刷新（核心修复）                                       ║
-# ╚═══════════════════════════════════════════════════════════════╝
-
 do_status_live() {
-    # ── 退出清理 ──────────────────────────────────────────────────
-    # 必须同时写 stdout 和 /dev/tty：
-    #   - Ctrl+C 时 bash 在 sleep 子进程退出后才跑 trap，stdout 缓冲可能已刷不到终端
-    #   - /dev/tty 直连控制终端，不受重定向/缓冲影响，是恢复光标最可靠的路径
     _status_live_cleanup() {
         trap - INT TERM HUP EXIT
-        # 两条路都写，哪条通哪条生效
         local _SHOW_CURSOR=$'\033[?25h'
-        printf '%s' "$_SHOW_CURSOR"                                          # stdout
-        tput cnorm 2>/dev/null || true                                       # stdout (terminfo)
+        printf '%s' "$_SHOW_CURSOR"
+        tput cnorm 2>/dev/null || true
         if [[ -w /dev/tty ]]; then
-            printf '%s' "$_SHOW_CURSOR" >/dev/tty                           # /dev/tty
-            tput cnorm >/dev/tty 2>/dev/null || true                        # /dev/tty (terminfo)
-            stty sane </dev/tty 2>/dev/null || true                         # 修复行规约
+            printf '%s' "$_SHOW_CURSOR" >/dev/tty
+            tput cnorm >/dev/tty 2>/dev/null || true
+            stty sane </dev/tty 2>/dev/null || true
         fi
     }
     trap '_status_live_cleanup; exit 0' INT TERM HUP
     trap '_status_live_cleanup'         EXIT
 
-    # ── 隐藏光标（同样双写保证生效）────────────────────────────────
     local _HIDE_CURSOR=$'\033[?25l'
     printf '%s' "$_HIDE_CURSOR"
     tput civis 2>/dev/null || true
@@ -1361,28 +1488,20 @@ do_status_live() {
         tput civis >/dev/tty 2>/dev/null || true
     fi
 
-    # ── 临时文件：渲染到文件再一次性输出，避免"先 clear 再慢渲染"闪烁 ──
     local tmp
     tmp=$(mktemp 2>/dev/null || echo "/tmp/foxwaf-status-$$")
     trap '_status_live_cleanup; rm -f "$tmp"; exit 0' INT TERM HUP
     trap '_status_live_cleanup; rm -f "$tmp"'         EXIT
 
-    # ── 首帧：清屏到顶（\033[2J 清整屏 + \033[H 光标回左上）──
-    # 之前的 bug 在这里：只在循环里用相对回跳（\033[<N>A），但如果上一帧因终端高度不够而滚屏，
-    # 后续回跳就会落到错误位置，造成 banner 累加。改用绝对清屏 + 一次性渲染缓冲，无副作用。
     printf '\033[2J\033[H'
     do_status 2>/dev/null >"$tmp"
     cat "$tmp"
     printf "  ${DM}Ctrl+C 退出  ·  每 0.5s 刷新${N}\n"
 
-    # ── 刷新循环（每帧绝对清屏 + 一次性输出，避免行数差异/滚屏导致的累加）──
     while true; do
         sleep 0.5
-        # 采集新内容（先写到 tmp，避免边采集边渲染的撕裂感）
         do_status 2>/dev/null >"$tmp"
-        # 绝对清屏到左上：终端再大或再小、frame 高度变化 都不会留残影
         printf '\033[H\033[2J'
-        # 一次性 cat：终端绘制开销最低
         cat "$tmp"
         printf "  ${DM}Ctrl+C 退出  ·  每 0.5s 刷新${N}\n"
     done
@@ -1395,6 +1514,7 @@ case "${1:-}" in
     status)    do_status_live ;;
     logs)      do_logs ;;
     update)    shift; do_update "$@" ;;
+    rollback)  do_rollback "${2:-latest}" ;;
     export)    do_export ;;
     import)    do_import "${2:-}" ;;
     reset-auth|--reset-auth) do_reset_auth "${2:-fox}" "${3:-}" ;;

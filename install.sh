@@ -529,6 +529,17 @@ install_docker() {
     else
         log_dim "保留配置: $INSTALL_DIR/conf.yaml"
     fi
+    local source_cid
+    source_cid=$(docker create "foxwaf:${VERSION}" 2>/dev/null) || die "无法从镜像读取 source.enc"
+    if ! docker cp "$source_cid:/app/source.enc" "$INSTALL_DIR/source.enc.new" 2>/dev/null \
+        || [[ ! -s "$INSTALL_DIR/source.enc.new" ]]; then
+        docker rm "$source_cid" &>/dev/null || true
+        rm -f "$INSTALL_DIR/source.enc.new"
+        die "无法从镜像提取 source.enc"
+    fi
+    docker rm "$source_cid" &>/dev/null || true
+    chmod 0644 "$INSTALL_DIR/source.enc.new"
+    mv "$INSTALL_DIR/source.enc.new" "$INSTALL_DIR/source.enc"
     cat > "$INSTALL_DIR/docker-compose.yml" << DEOF
 services:
   foxwaf:
@@ -538,9 +549,10 @@ services:
     network_mode: host
     volumes:
       - ./conf.yaml:/app/conf.yaml
+      - ./source.enc:/app/source.enc
       - ./data:/app/data
 DEOF
-    log_ok "Compose 配置已生成（conf.yaml、data/ 与插件配置已持久化）"
+    log_ok "Compose 配置已生成（conf.yaml、source.enc、data/ 与插件配置已持久化）"
     echo "$VERSION" > "$INSTALL_DIR/.version"
     install_foxwaf_bin
 
